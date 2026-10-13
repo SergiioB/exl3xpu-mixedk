@@ -38,7 +38,7 @@ Everything was run on Linux with the `xe` driver, one B70 per job.
 | `turboderp/Qwen3.8-27B-exl3` `4.00bpw` (uniform K = 4) | tested, no regression vs stock exl3xpu |
 | `turboderp/Qwen3.8-27B-exl3` `SC_5.00bpw_H6_V6` | not loadable yet: text weights are the same as `SC_5.00bpw_H6`, but the quantized vision tower keys fail to load |
 | Other EXL3 model architectures | untested. exl3xpu ships its own per-model routes |
-| Qwen3.8-Flash-Next | not covered. It is a different engine (served as GGUF with llama.cpp), not EXL3 |
+| `turboderp/Qwen3.8-Flash-Next-exl3` (any branch) | not supported. Checked 2026-10-14: the image's vLLM has no Flash-Next model class, exl3xpu has no MoE path, and the smallest quant (2.05 bpw, 58.5 GiB) does not fit one 32 GB card. On the B70 we run Flash-Next as GGUF with Strata instead |
 | K = 8 or non-mul1 codebooks | not supported (`Geo<8>` fails a kernel static assert) |
 | CUDA or other GPUs | not supported. ESIMD/SYCL only, no CUDA path; other Arc GPUs not tested |
 
