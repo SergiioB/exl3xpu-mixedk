@@ -1,0 +1,132 @@
+diff --git a/csrc/exl3_ops.sycl b/csrc/exl3_ops.sycl
+index a4299ec..07961bc 100644
+--- a/csrc/exl3_ops.sycl
++++ b/csrc/exl3_ops.sycl
+@@ -180,7 +180,7 @@ static int g_target_threads_mb64 = 2048;
+ 
+ // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
+ // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
+-constexpr int nt_of(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
++constexpr int nt_of(int K, int MR) { return MR == 8 ? (K == 3 || K == 5 || K == 7 ? 4 : 2) : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }   // K=3/5/7 decode TP=4 tiles per op (G=8): NT must stay a multiple of TP for MR=8 too
+ static int nt_for(int K, int MR) { return nt_of(K, MR); }
+ 
+ template <int K, int CB>
+@@ -263,9 +263,17 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
+         bool done = false;
+         if (K == 4 && cb == 2) done = fused_small<4, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
+         else if (K == 6 && cb == 2) done = fused_small<6, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
++        else if (K == 2 && cb == 2) done = fused_small<2, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
++        else if (K == 3 && cb == 2) done = fused_small<3, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
++        else if (K == 5 && cb == 2) done = fused_small<5, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
++        else if (K == 7 && cb == 2) done = fused_small<7, 2>(x, trellis, suh, svh, shard_of_nb, out, M, Kdim, N, q);
+         if (done) return;
+     }
+     bool use_vec = M <= g_vec_max_m;
++    // The generic (non-build_k4) DPAS operand build runs 0.6-0.65x of K=4 at M<=4 on B70;
++    // the vector kernel beats DPAS for odd K there (A/B on the serving matrix): K5 317->440 GB/s on
++    // 5120x34816 etc. Route odd-K and tiny-N K6 verify-size calls to GEMV. Graph capture bakes it.
++    if (!use_vec && M <= 4 && ((K & 1) || (K == 6 && N <= 2048))) use_vec = true;
+     int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
+ #ifdef EXL3_DPAS_MB4
+     int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+@@ -304,8 +312,8 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
+     if (K == KK && cb == CC) ok = use_vec ? dispatch_mr<KK, CC>(MR, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q) \
+                                           : dispatch_dpas<KK, CC>(MB, xh, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+     EXL3_CASE(4, 2) EXL3_CASE(6, 2)
++    EXL3_CASE(2, 2) EXL3_CASE(3, 2) EXL3_CASE(5, 2) EXL3_CASE(7, 2)
+ #ifdef EXL3_ALL_CODEBOOKS
+-    EXL3_CASE(2, 2) EXL3_CASE(3, 2) EXL3_CASE(5, 2)
+     EXL3_CASE(4, 0) EXL3_CASE(4, 1) EXL3_CASE(6, 0) EXL3_CASE(6, 1)
+ #endif
+ #undef EXL3_CASE
+@@ -533,6 +541,20 @@ static void launch_reconstruct_q8(const at::Tensor& tr, at::Tensor& w, int n0, s
+     q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(round_up(n, local), local), k); });
+ }
+ 
++// mul1 codebook bound 3.453125 holds for every K (codebook values are K-independent), so the int8
++// prefill path covers all supported K.
++static void reconstruct_q8(int64_t K, const at::Tensor& tr, at::Tensor& w, int64_t n0, sycl::queue& q) {
++    switch (K) {
++        case 2: launch_reconstruct_q8<2>(tr, w, (int)n0, q); return;
++        case 3: launch_reconstruct_q8<3>(tr, w, (int)n0, q); return;
++        case 4: launch_reconstruct_q8<4>(tr, w, (int)n0, q); return;
++        case 5: launch_reconstruct_q8<5>(tr, w, (int)n0, q); return;
++        case 6: launch_reconstruct_q8<6>(tr, w, (int)n0, q); return;
++        case 7: launch_reconstruct_q8<7>(tr, w, (int)n0, q); return;
++    }
++    TORCH_CHECK(false, "exl3 int8 prefill: unsupported K ", K);
++}
++
+ void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, int64_t cb) {
+     TORCH_CHECK(w.scalar_type() == at::kHalf && w.is_contiguous() && w.size(1) % 128 == 0 && n0 % 128 == 0);
+     TORCH_CHECK(w.size(0) == trellis.size(0) * 16 && n0 + w.size(1) <= trellis.size(1) * 16);
+@@ -540,10 +562,11 @@ void exl3_reconstruct(at::Tensor trellis, at::Tensor w, int64_t n0, int64_t K, i
+     bool ok = true;
+     if (K == 4 && cb == 2) launch_reconstruct<4, 2>(trellis, w, n0, q);
+     else if (K == 6 && cb == 2) launch_reconstruct<6, 2>(trellis, w, n0, q);
+-#ifdef EXL3_ALL_CODEBOOKS
+     else if (K == 2 && cb == 2) launch_reconstruct<2, 2>(trellis, w, n0, q);
+     else if (K == 3 && cb == 2) launch_reconstruct<3, 2>(trellis, w, n0, q);
+     else if (K == 5 && cb == 2) launch_reconstruct<5, 2>(trellis, w, n0, q);
++    else if (K == 7 && cb == 2) launch_reconstruct<7, 2>(trellis, w, n0, q);
++#ifdef EXL3_ALL_CODEBOOKS
+     else if (K == 4 && cb == 1) launch_reconstruct<4, 1>(trellis, w, n0, q);
+     else if (K == 4 && cb == 0) launch_reconstruct<4, 0>(trellis, w, n0, q);
+ #endif
+@@ -582,10 +605,11 @@ at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor s
+     int P = 4, rps = (tk + P - 1) / P; P = (tk + rps - 1) / rps;
+     auto part = at::zeros({P, M, N}, xh_blocked.options().dtype(at::kFloat));
+     bool ok = false;
+-    if (K == 4 && cb == 2) ok = use_vec ? dispatch_mr<4, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+-                                        : dispatch_dpas<4, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
+-    if (K == 6 && cb == 2) ok = use_vec ? dispatch_mr<6, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q)
+-                                        : dispatch_dpas<6, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
++#define EXL3_RAW_CASE(KK) \
++    if (K == KK && cb == 2) ok = use_vec ? dispatch_mr<KK, 2>(MR, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q) \
++                                         : dispatch_dpas<KK, 2>(MB, xh_blocked, trellis, shard_of_nb, part, M, Kdim, N, P, rps, q);
++    EXL3_RAW_CASE(4) EXL3_RAW_CASE(6) EXL3_RAW_CASE(2) EXL3_RAW_CASE(3) EXL3_RAW_CASE(5) EXL3_RAW_CASE(7)
++#undef EXL3_RAW_CASE
+     TORCH_CHECK(ok);
+     (void)S;
+     return part.sum(0);
+@@ -658,7 +682,7 @@ at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Ten
+         return out.view(shape);
+     }
+     int64_t S = suh.size(0);
+-    if (g_int8 && cb == 2 && (K == 4 || K == 6) && M > 16) {
++    if (g_int8 && cb == 2 && K >= 2 && K <= 7 && M > 16) {
+         auto& q = queue_of(x2);
+ #ifdef EXL3_DNNL
+         // GEMM rows padded to 256: bounds the number of oneDNN primitives (one per (Ms, K, N)) on real traffic
+@@ -705,7 +729,7 @@ at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Ten
+             for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+                 int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
+                 auto w = at::empty({k, ng}, x.options().dtype(at::kChar));
+-                if (K == 4) launch_reconstruct_q8<4>(trellis, w, g0, q); else launch_reconstruct_q8<6>(trellis, w, g0, q);
++                reconstruct_q8(K, trellis, w, g0, q);
+                 q8dnnl::gemm(q, x, reinterpret_cast<const int8_t*>(xq.data_ptr()) + g * Ms * k,
+                              reinterpret_cast<const int8_t*>(w.data_ptr()), swt.data_ptr<float>(),
+                              sx.data_ptr<float>() + g * Ms, reinterpret_cast<fp16*>(y.data_ptr()) + g0, Ms, k, ng, n);
+@@ -717,7 +741,7 @@ at::Tensor exl3_linear(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Ten
+         for (size_t g = 0; g + 1 < group_bounds.size(); ++g) {
+             int64_t g0 = group_bounds[g], g1 = group_bounds[g + 1], ng = g1 - g0;
+             auto w = at::empty({k, ng}, x.options().dtype(at::kChar));
+-            if (K == 4) launch_reconstruct_q8<4>(trellis, w, g0, q); else launch_reconstruct_q8<6>(trellis, w, g0, q);
++            reconstruct_q8(K, trellis, w, g0, q);
+             auto y = at::_int_mm(xq[g], w);                                   // [M, ng] int32
+             int n_out = M * (ng / 128);
+             auto run_out = [&](auto tag) {
+@@ -757,10 +781,11 @@ at::Tensor exl3_linear_meta(at::Tensor x, at::Tensor trellis, at::Tensor suh, at
+     return at::empty(shape, x.options());
+ }
+ 
++const char* exl3xpu_build_tag() { return "mixedk_20261012c"; }
++
+ bool exl3_supported(int64_t K, int64_t cb) {
+-    if (cb == 2 && (K == 4 || K == 6)) return true;
++    if (cb == 2 && K >= 2 && K <= 7) return true;   // mul1 K=2..7 (K=8: Geo V=4 < 8, unsupported by the kernels)
+ #ifdef EXL3_ALL_CODEBOOKS
+-    if (cb == 2 && (K == 2 || K == 3 || K == 5)) return true;
+     if ((cb == 0 || cb == 1) && (K == 4 || K == 6)) return true;
+ #endif
+     return false;

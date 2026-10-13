@@ -1,0 +1,53 @@
+b70/ — Intel Arc Pro B70 additions to this exllamav3 fork
+
+This directory builds on the work of others. Their copyright notices and
+license terms are reproduced below.
+
+1. ExLlamaV3 and the EXL3 format
+   https://github.com/turboderp-org/exllamav3
+   Copyright (c) 2025 Turboderp
+   License: MIT (see ../LICENSE in this repository)
+
+   The quantizer in b70/quantize/ writes EXL3-format tensors and follows the
+   EXL3 per-channel scaling order of exllamav3 v1.4.2
+   (exllamav3/modules/quant/exl3_lib/quantize.py). The models used for the
+   checks are turboderp's Qwen3.8-27B EXL3 quantizations
+   (https://huggingface.co/turboderp/Qwen3.8-27B-exl3).
+
+2. exl3xpu — EXL3 inference on Intel Arc as a vLLM XPU plugin
+   https://github.com/sybil-solutions/exl3xpu (formerly github.com/0xSero/exl3xpu)
+   Container image ghcr.io/0xsero/exl3xpu (version 0.1.0)
+   Copyright (c) 2026 0xSero
+   License: MIT
+
+   b70/serve/patches/*.patch modify exl3xpu 0.1.0 files
+   (csrc/exl3_ops.sycl, exl3xpu/vllm_plugin.py). b70/serve/tests/check_mixedk.py
+   imports exl3xpu's ref.py and plugin classes inside that image. The
+   quantizer's tests and export self-checks use exl3xpu's ref.py as the
+   decode reference (not redistributed here).
+
+   MIT License text (applies to both projects above, with their respective
+   copyright lines):
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+3. QTIP (algorithm reference only; no code copied or imported)
+   https://github.com/Cornell-RelaxML/qtip, arXiv:2406.11235
+   The BlockLDLQ sweep and tail-biting Viterbi in b70/quantize/quantize.py are
+   independent reimplementations of the published algorithm.
