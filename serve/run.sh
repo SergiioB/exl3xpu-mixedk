@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Serve an EXL3 checkpoint (uniform or mixed K=2..7) with the patched exl3xpu image.
-# This is the serve command used for the checks in b70/README.md.
+# This is the serve command used for the checks in README.md.
 #
 #   MODEL_DIR  (required) local EXL3 model directory, mounted read-only
-#   IMAGE      image tag built from b70/serve/Dockerfile (default exl3xpu-b70:mixedk)
+#   IMAGE      image tag built from serve/Dockerfile (default exl3xpu-b70:mixedk)
 #   GPU_INDEX  card index passed to serve.py --gpu (default 0)
 #   PORT       OpenAI-compatible HTTP port (default 8022)
 #   NAME       container name (default exl3xpu-b70)

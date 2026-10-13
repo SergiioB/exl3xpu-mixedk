@@ -1,0 +1,12 @@
+# Label-only layer over the published 20261013 image (built from serve/Dockerfile
+# at exllamav3 fork commit 244f57e). No files change; only the OCI labels do, so
+# the package page links this repository.
+FROM ghcr.io/sergiiob/exl3xpu-mixedk:20261013@sha256:5e2d1fab3a8ba559b4d3af7fb1fa5eeff324c4f4274847e3079ec2d57c698ba4
+LABEL org.opencontainers.image.title="exl3xpu-mixedk" \
+      org.opencontainers.image.description="0xSero's exl3xpu (vLLM XPU plugin for EXL3) patched to serve mixed-bit EXL3 quants such as turboderp's Qwen3.8-27B SC_5.00bpw_H6 on one Intel Arc Pro B70." \
+      org.opencontainers.image.source="https://github.com/SergiioB/exl3xpu-mixedk" \
+      org.opencontainers.image.url="https://github.com/SergiioB/exl3xpu-mixedk" \
+      org.opencontainers.image.revision="244f57e5c220a5ea6e438869fa996c5b7e96ca75" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.authors="SergiioB; base exl3xpu by 0xSero; ExLlamaV3 and EXL3 by turboderp" \
+      org.opencontainers.image.version="20261014"

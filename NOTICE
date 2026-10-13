@@ -1,14 +1,14 @@
-b70/ — Intel Arc Pro B70 additions to this exllamav3 fork
+exl3xpu-mixedk: mixed-K EXL3 serving and an ESIMD EXL3 quantizer for Intel Arc Pro B70
 
-This directory builds on the work of others. Their copyright notices and
+This repository builds on the work of others. Their copyright notices and
 license terms are reproduced below.
 
 1. ExLlamaV3 and the EXL3 format
    https://github.com/turboderp-org/exllamav3
    Copyright (c) 2025 Turboderp
-   License: MIT (see ../LICENSE in this repository)
+   License: MIT
 
-   The quantizer in b70/quantize/ writes EXL3-format tensors and follows the
+   The quantizer in quantize/ writes EXL3-format tensors and follows the
    EXL3 per-channel scaling order of exllamav3 v1.4.2
    (exllamav3/modules/quant/exl3_lib/quantize.py). The models used for the
    checks are turboderp's Qwen3.8-27B EXL3 quantizations
@@ -20,8 +20,8 @@ license terms are reproduced below.
    Copyright (c) 2026 0xSero
    License: MIT
 
-   b70/serve/patches/*.patch modify exl3xpu 0.1.0 files
-   (csrc/exl3_ops.sycl, exl3xpu/vllm_plugin.py). b70/serve/tests/check_mixedk.py
+   serve/patches/*.patch modify exl3xpu 0.1.0 files
+   (csrc/exl3_ops.sycl, exl3xpu/vllm_plugin.py). serve/tests/check_mixedk.py
    imports exl3xpu's ref.py and plugin classes inside that image. The
    quantizer's tests and export self-checks use exl3xpu's ref.py as the
    decode reference (not redistributed here).
@@ -49,5 +49,5 @@ license terms are reproduced below.
 
 3. QTIP (algorithm reference only; no code copied or imported)
    https://github.com/Cornell-RelaxML/qtip, arXiv:2406.11235
-   The BlockLDLQ sweep and tail-biting Viterbi in b70/quantize/quantize.py are
+   The BlockLDLQ sweep and tail-biting Viterbi in quantize/quantize.py are
    independent reimplementations of the published algorithm.

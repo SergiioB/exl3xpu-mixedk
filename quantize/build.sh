@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the ESIMD Viterbi worker (JIT only) into b70/quantize/build/.
+# Build the ESIMD Viterbi worker (JIT only) into quantize/build/.
 # Requires the Intel oneAPI DPC++ compiler (icpx). ONEAPI_ROOT defaults to /opt/intel/oneapi.
 # Do NOT add -fsycl-targets=spir64_gen (-device bmg): the AOT build miscompiles this kernel.
 set -euo pipefail

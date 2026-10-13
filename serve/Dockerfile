@@ -1,7 +1,7 @@
 # exl3xpu + mixed-K EXL3 (K=2..7) for Intel Arc Pro B70.
 # Base image is 0xSero's exl3xpu 0.1.0, pinned by digest. This only patches
 # csrc/exl3_ops.sycl and exl3xpu/vllm_plugin.py, then rebuilds exl3xpu/_C.so.
-# Build context: the b70/serve directory.
+# Build context: the serve directory.
 FROM ghcr.io/0xsero/exl3xpu@sha256:21412bdd7535e9c653eeb3d099dce3bc79a83d440def2cd9556111c79c870fa8
 
 LABEL org.opencontainers.image.source="https://github.com/SergiioB/exllamav3" \

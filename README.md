@@ -1,175 +1,160 @@
-# exllamav3 on Intel Arc Pro B70 (Xe2 / BMG)
+# exl3xpu-mixedk
 
-This directory adds two things for the Intel Arc Pro B70, and nothing else:
+Patches to 0xSero's exl3xpu so that mixed-bit EXL3 models (for example turboderp's
+Qwen3.8-27B `SC_5.00bpw_H6`) can be served with vLLM on one Intel Arc Pro B70, plus an
+EXL3 trellis quantizer that runs on the B70.
 
-1. **Serving mixed-bit EXL3 models.** Two patches to [0xSero's exl3xpu](https://github.com/sybil-solutions/exl3xpu)
-   vLLM XPU plugin let it serve turboderp EXL3 quants whose tensors use different
-   bit widths (K = 2..7 per tensor, mul1 codebook), for example
-   `turboderp/Qwen3.8-27B-exl3` branch `SC_5.00bpw_H6`. Stock exl3xpu 0.1.0
-   serves only K = 4 and K = 6, and every tensor in a fused module must share the same K.
-2. **An EXL3 trellis quantizer that runs on the B70.** A tail-biting Viterbi
-   encoder written in ESIMD (`quantize/viterbi_esimd.cpp`), a Python quantizer
-   (BlockLDLQ, EXL3 incoherence and per-channel scales) that drives it
-   (`quantize/quantize.py`), and a writer that puts quantized tensors into an
-   EXL3 model directory (`quantize/export_exl3.py`).
+## Built on
 
-Everything here was built and checked on Linux (`xe` kernel driver) in a host with
-two Arc Pro B70 cards. Every check used one card. None of it runs on CUDA, and no
-other GPU was tested. Nothing outside `b70/` was changed, apart from a pointer at
-the top of the repository README.
+- **[exl3xpu](https://github.com/sybil-solutions/exl3xpu)** by 0xSero (MIT): the vLLM XPU
+  plugin and SYCL/ESIMD EXL3 kernels. Our image starts from
+  `ghcr.io/0xsero/exl3xpu:0.1.0` pinned by digest. Most of the serving work is theirs.
+- **[ExLlamaV3](https://github.com/turboderp-org/exllamav3)** by turboderp (MIT): the EXL3
+  format, and the [Qwen3.8-27B EXL3 quants](https://huggingface.co/turboderp/Qwen3.8-27B-exl3)
+  including the self-calibrated `SC_*` branches used here.
+- **vLLM**, which runs inside the exl3xpu image.
+- **Intel's XPU base container**, which the exl3xpu image is built on.
+- **[QTIP](https://github.com/Cornell-RelaxML/qtip)** (Cornell-RelaxML): the BlockLDLQ and
+  tail-biting Viterbi algorithms, reimplemented in our quantizer.
 
-```
-b70/
-  NOTICE                      credits and licenses (turboderp, 0xSero, QTIP)
-  serve/Dockerfile            patched image on top of the pinned exl3xpu digest
-  serve/patches/0001-exl3-ops-mixed-k.patch      csrc/exl3_ops.sycl
-  serve/patches/0002-vllm-plugin-mixed-k.patch   exl3xpu/vllm_plugin.py
-  serve/run.sh                serve command used for the checks below
-  serve/tests/check_mixedk.py kernel checks against exl3xpu ref.py (inside the image)
-  serve/tests/canary.py       6 exact-answer canaries + 3 long-prompt (~8.2K-token) cells
-  serve/tests/canary_prompts.json
-  serve/tests/multiturn.py    multi-turn prefix-cache-on check
-  quantize/viterbi_esimd.cpp  ESIMD tail-biting Viterbi (worker binary / shared library)
-  quantize/build.sh           JIT build with icpx
-  quantize/verify_viterbi.py  kernel output vs CPU reference, bit for bit
-  quantize/quantize.py        quantizer (torch reference backend + ESIMD backend)
-  quantize/test_quantize.py   CPU unit tests
-  quantize/check_tensor_bitexact.py  real-tensor ESIMD vs torch per-launch check
-  quantize/export_exl3.py     EXL3 directory writer + self-tests
-```
+## What this adds
 
-## What works and how it was checked
+- `serve/patches/0001-exl3-ops-mixed-k.patch` (`csrc/exl3_ops.sycl`): builds the decode
+  and matmul kernels for K = 2..7 instead of only K = 4 and 6, and sends small odd-K
+  verify calls to the GEMV kernel, so SC quants decode at a usable speed.
+- `serve/patches/0002-vllm-plugin-mixed-k.patch` (`exl3xpu/vllm_plugin.py`): lets one
+  fused module (for example qkv) hold tensors with different K, so mixed-K checkpoints load.
+- `quantize/`: an ESIMD tail-biting Viterbi encoder and a Python quantizer and writer,
+  so EXL3 tensors can be quantized on the B70 itself.
 
-All numbers are **self-reported screens** from a single host (evidence tier E2:
-self-reported, with raw logs kept privately). Nobody else has reproduced them yet.
-Tests ran on one Arc Pro B70 with its power cap set to 230 W, except where noted. Measured draw is
-listed only where it was recorded.
+## What it covers
 
-### Serving (patched exl3xpu, image built from `serve/Dockerfile`)
+Everything was run on Linux with the `xe` driver, one B70 per job.
 
-Models: `turboderp/Qwen3.8-27B-exl3`
-- branch `SC_5.00bpw_H6`, commit `dfe2f4fd71bf9a1994051d4d47e6460fa96dd723` (mixed K = 4..7, called "SC5" below)
-- branch `4.00bpw`, commit `113cf7ab958054860e43fb7f3063b1af19171095` (uniform K = 4, called "plain 4.0" below)
-
-Serve config: the image's default Qwen3.8-27B route, with MTP 3-token
-speculation, `FULL_DECODE_ONLY` XPU graphs, fp8 KV cache and int8 prefill.
-`gpu_memory_utilization=0.90`, `max_model_len=65536`, client concurrency C1.
-
-| Check | Result |
+| Model / quant | Status |
 |---|---|
-| `check_mixedk.py` on real SC5 tensors (K = 4, 5, 6, 7). It checks reconstruct `torch.equal` against `exl3xpu.ref`, `linear` against an fp32 reference at M = 1..512 for the fp16 and int8 paths, and a fused mixed-K qkv module `[5,7,7]` loaded through the real plugin loaders | **46/46 pass** |
-| `canary.py`, SC5, greedy decoding, `max_tokens=512` | **6/6 exact answers**, plus **3/3** long cells (8,161–8,162 prompt tokens) |
-| `multiturn.py` with prefix cache on, `turboderp/Qwen3.8-27B-exl3` `SC_4.00bpw_H5` (mixed K = 3..6; other card, 180 W cap, `gpu_memory_utilization=0.85`) | **pass**: facts planted in the shared context were recalled correctly on every later turn |
-| `exl3_supported(K, cb=2)` in the image build step | true for K = 2..7. False for K = 8 (`Geo<8>` fails the kernel's `V>=8` static assert, so it is not supported) |
+| `turboderp/Qwen3.8-27B-exl3` `SC_5.00bpw_H6` (K = 4..7) | tested, works (main target) |
+| `turboderp/Qwen3.8-27B-exl3` `SC_4.00bpw_H5` (K = 3..6) | tested, works (multi-turn check) |
+| `turboderp/Qwen3.8-27B-exl3` `4.00bpw` (uniform K = 4) | tested, no regression vs stock exl3xpu |
+| `turboderp/Qwen3.8-27B-exl3` `SC_5.00bpw_H6_V6` | not loadable yet: text weights are the same as `SC_5.00bpw_H6`, but the quantized vision tower keys fail to load |
+| Other EXL3 model architectures | untested. exl3xpu ships its own per-model routes |
+| Qwen3.8-Flash-Next | not covered. It is a different engine (served as GGUF with llama.cpp), not EXL3 |
+| K = 8 or non-mul1 codebooks | not supported (`Geo<8>` fails a kernel static assert) |
+| CUDA or other GPUs | not supported. ESIMD/SYCL only, no CUDA path; other Arc GPUs not tested |
 
-**Odd-K small-M reroute (patch 0001).** Verify calls with M ≤ 4 and odd K, or
-K = 6 with N ≤ 2048, now go to the GEMV kernel instead of DPAS. Speed screen:
-SC5, MTP3, greedy, prompt 512 / output 128 tokens, C1. Metric: client-side
-post-first-token decode tok/s, n = 3 after 1 warmup, median. Prefix-cache state
-was not checked for this screen. Draw was not recorded (cap 230 W).
+## Quick start
 
-| Image | Decode tok/s (3 samples) | Median |
+With [b70-launcher](https://github.com/SergiioB/b70-launcher) 0.6.2 or later:
+
+```bash
+b70 launch qwen38-27b-sc5
+```
+
+Or run the image directly (this is `serve/run.sh` with the public image):
+
+```bash
+MODEL_DIR=/path/to/Qwen3.8-27B-exl3-SC_5.00bpw_H6
+IMAGE=ghcr.io/sergiiob/exl3xpu-mixedk@sha256:933eda54bb51a2e8a6669a70f5a2d7696fabd12a5f8b7c469df02fdfecc79d3a
+docker run -d --name exl3xpu-b70 \
+  --device=/dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)" \
+  --network=host --memory=30g \
+  -v "$MODEL_DIR:/model:ro" \
+  --entrypoint python3 "$IMAGE" \
+  /opt/exl3xpu/scripts/serve.py /opt/exl3xpu/models/qwen3.8-27b-exl3-4.00bpw \
+  --gpu 0 --model-path /model --port 8022 \
+  --set vllm.gpu_memory_utilization=0.90 --set vllm.max_model_len=65536
+```
+
+This serves an OpenAI-compatible API on port 8022 (model name `qwen3.8-27b-exl3`).
+Weights are mmapped (about 20 GB for SC5). To turn off MTP speculation, add
+`--set vllm.speculative_config=null`.
+
+To build the image yourself: `docker build -t exl3xpu-b70:mixedk serve`, then
+`MODEL_DIR=... bash serve/run.sh`. The patches also apply to exl3xpu 0.1.0 with
+`patch -p1` from the package root (`/opt/exl3xpu` in the image).
+
+### Images
+
+| Tag | Digest | Notes |
 |---|---|---|
-| without the reroute (otherwise identical patch) | 56.4 / 57.9 / 56.7 | 56.7 |
-| with the reroute (this release) | 68.4 / 70.3 / 70.3 | 70.3 |
+| `20261014` | `sha256:933eda54bb51a2e8a6669a70f5a2d7696fabd12a5f8b7c469df02fdfecc79d3a` | same layers as `20261013`, labels point to this repo (`serve/Dockerfile.labels`) |
+| `20261013` | `sha256:5e2d1fab3a8ba559b4d3af7fb1fa5eeff324c4f4274847e3079ec2d57c698ba4` | built from `serve/Dockerfile` (fork commit 244f57e) |
+| `20261012c` | `sha256:7bb0c5cf...` | built from the tree just before that commit, same behavior |
 
-On the same screen, plain 4.0 measured 83.7 / 83.7 / 79.6 on the patched image
-and 80.1 / 84.0 / 79.6 on the stock image. This uniform-K run was a check for
-regressions only, not a speed claim.
+## Results
 
-**Mixed-K is slower than plain 4.0, not faster.** Paired A/B test: A = plain 4.0
-on the stock `ghcr.io/0xsero/exl3xpu` 0.1.0 digest, B = SC5 on this patched image.
-Sampling: temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5, `ignore_eos`,
-thinking off. MTP3 on, C1, output 128 tokens (all samples hit the length limit).
-n = 5 per arm, ABBA order over 4 server loads, 1 discarded warmup per arm and cell,
-unique prompts (prefix-cache hit delta 0). Metric: completion tokens /
-(last − first token time), median. Measured average draw was about 230 W in both
-arms (hwmon energy counter). Comparison class: `matched_except_quant`; the image
-also differs between arms.
+All numbers are self-reported from one host and have not been reproduced by anyone else.
+One B70, power cap 230 W unless noted.
 
-| Cell (actual prompt tokens) | A plain 4.0 | B SC5 | B/A |
-|---|---|---|---|
-| p524 / g128 | 63.56 | 56.62 | 0.89 |
-| p8124 / g128 | 64.34 | 56.82 | 0.88 |
+Serve config for every serving check: the image's Qwen3.8-27B route, MTP 3-token
+speculation, `FULL_DECODE_ONLY` XPU graphs, fp8 KV cache, int8 prefill,
+`gpu_memory_utilization=0.90`, `max_model_len=65536`, one client at a time (C1).
+Models: `SC_5.00bpw_H6` at commit `dfe2f4fd` ("SC5") and `4.00bpw` at commit `113cf7ab` ("plain 4.0").
 
-SC5 is a quality-oriented quant. This release makes it servable on a B70; it does
-not make it faster than plain 4.0.
-
-### Quantizer (ESIMD Viterbi + `quantize.py`)
+### Checks
 
 | Check | Result |
 |---|---|
-| `verify_viterbi.py`: kernel states vs the CPU tail-biting Viterbi, 64 Gaussian 256-weight sequences, mul1 code, margins 0 / 8 / 16 | **64/64 sequences bit-exact**, identical MSE, all circular-consistent |
-| `check_tensor_bitexact.py` (dual mode: torch and ESIMD Viterbi on the same input at every LDLQ launch). Qwen3.8-27B BF16 layer 2, K = 4, LDLQ, margin 16 | `linear_attn.in_proj_qkv` [10240×5120]: **320 launches, 0 mismatched states**. `mlp.down_proj` [5120×17408]: **1088 launches, 0 mismatched states**. Packed trellis and W_hat `torch.equal` |
-| Same, margin 0, `in_proj_qkv` | 320 launches, 0 mismatched states, bit-exact |
-| Current `quantize.py` with per-channel scales, margin 0, dual mode | layer 0 `linear_attn.out_proj`: 384 launches, 0 mismatches. Layer 2 `in_proj_qkv` with LDLQ: 320 launches, 0 mismatches |
-| `ref.weight_orig(trellis, suh, svh)` from exl3xpu on quantizer output (per-channel scales) | equals the quantizer's W_hat bit for bit (CPU synthetic 256×512; real layer-2 `down_proj` after export) |
-| `export_exl3.py --selftest-a`: rebuild a turboderp Qwen3.8-27B EXL3 directory from its own 400 extracted modules | output shards **byte-identical** to the template. `--check-keys` on a real export: all 2,426 template keys present, with the same shape and dtype |
-| `test_quantize.py --device cpu --quick` with exl3xpu 0.1.0 `ref.py` (pack/decode vs ref.py for K = 3/4/5, Viterbi vs brute force, tail-biting, `quantize()` API, Gaussian MSE vs the rate-distortion bound, LDLQ ≤ plain Viterbi) | **16/16 pass**. The non-`--quick` Gaussian test (2,048 tiles) needs more than 8 GiB of RAM on CPU |
+| `serve/tests/check_mixedk.py` on real SC5 tensors (K = 4..7): reconstruct vs `exl3xpu.ref` (`torch.equal`), `linear` vs fp32 at M = 1..512 for fp16 and int8 paths, fused mixed-K qkv `[5,7,7]` through the real plugin loaders | 46/46 pass |
+| `serve/tests/canary.py`, SC5, greedy, `max_tokens=512` | 6/6 exact answers, 3/3 long prompts (8,161 to 8,162 tokens) |
+| `serve/tests/multiturn.py`, prefix cache on, `SC_4.00bpw_H5` (other card, 180 W cap, `gpu_memory_utilization=0.85`) | pass: planted facts recalled on every later turn |
 
-Speed screen, mul1 kernel only (one card, synthetic input, nseq = 1024, one run
-per setting, build from just before the final tie-break fix): **1.06 s per 1M
-weights at margin 8, 1.09 s at margin 16**. End-to-end `quantize()` per real
-tensor on one card (ESIMD backend, margin 16, including U conversion, LDLQ
-feedback and pack/decode checks): 2.45 s per 1M weights (`in_proj_qkv`) and
-2.69 s per 1M weights (`down_proj`).
+### Speed: SC5 is slower than plain 4.0
 
-The export self-test (`--selftest-a`) and key check were run and recorded during
-development, but their console logs were not kept.
+Paired A/B. A = plain 4.0 on stock `ghcr.io/0xsero/exl3xpu:0.1.0`, B = SC5 on this image.
+Temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5, `ignore_eos`, thinking off,
+MTP3, C1, 128 output tokens. n = 5 per arm in ABBA order over 4 server loads, one discarded
+warmup per arm and cell, unique prompts (no prefix-cache hits). Metric: completion tokens
+/ (last token time - first token time), median. Average draw about 230 W in both arms.
 
-## Quickstart: serving
+| Prompt tokens | A plain 4.0 tok/s | B SC5 tok/s | B/A |
+|---|---|---|---|
+| 524 | 63.56 | 56.62 | 0.89 |
+| 8,124 | 64.34 | 56.82 | 0.88 |
+
+The GEMV reroute in patch 0001 matters: on a separate greedy screen (prompt 512,
+output 128, n = 3 after one warmup, median), SC5 decoded at 56.7 tok/s without it and
+70.3 tok/s with it.
+
+### Quality: SC5 is closer to BF16 than plain 4.0
+
+KL divergence of next-token distributions vs the BF16 model, as the ratio SC5 / plain 4.0
+(lower is better for SC5).
+
+| Text | Positions | KL ratio SC5 / plain 4.0 | Top-1 agreement with BF16 (SC5 vs plain 4.0) |
+|---|---|---|---|
+| wikitext | 1,664 | 0.42x | not reported |
+| held-out chat | 1,531 | 0.16x | 98.1% vs 96.4% |
+
+SC5 gives up 11 to 12% decode speed for lower error vs BF16.
+
+## Our quantizer
+
+The quantizer in `quantize/` works, but it does not beat turboderp's.
+
+- The ESIMD Viterbi kernel matches the CPU reference bit for bit: 64/64 Gaussian
+  sequences (`verify_viterbi.py`), and 0 mismatched states over 320 launches
+  (`in_proj_qkv`) and 1,088 launches (`down_proj`) on real Qwen3.8-27B layer-2 tensors
+  (`check_tensor_bitexact.py`).
+- exl3xpu's `ref.weight_orig` on our output equals our W_hat bit for bit, and
+  `export_exl3.py --selftest-a` rebuilds a turboderp EXL3 directory byte for byte.
+- `test_quantize.py --device cpu --quick`: 16/16 pass.
+- A full Qwen3.8-27B quant made with it scored KL vs BF16 of 0.89x turboderp's on
+  wikitext and 1.09x on held-out chat. So: slightly better on one set, worse on the other.
+- Speed: about 1.1 s per 1M weights for the kernel alone, 2.5 to 2.7 s per 1M weights
+  end to end per tensor on one card.
+
+It is a per-tensor tool plus a writer, not a one-command converter. The full-model driver
+(calibration capture, Hessians, layer loop) is not published; you need your own
+calibration pass to produce H for each linear layer.
 
 ```bash
-# 1. Build the patched image. Base pinned by digest; only _C.so and the plugin change.
-docker build -t exl3xpu-b70:mixedk b70/serve
-
-# 2. Serve an EXL3 model directory (mixed or uniform K = 2..7).
-MODEL_DIR=/path/to/Qwen3.8-27B-exl3-SC_5.00bpw_H6 GPU_INDEX=0 PORT=8022 \
-  bash b70/serve/run.sh
-#    Weights are mmapped (~20 GB for SC5); run.sh sets --memory=30g.
-#    No speculation: append --set vllm.speculative_config=null
-
-# 3. Canary (from the host; stdlib only). Greedy; needs max_tokens >= 512 because SC5 thinks first.
-python3 b70/serve/tests/canary.py --base http://127.0.0.1:8022 \
-  --model qwen3.8-27b-exl3 --prompts b70/serve/tests/canary_prompts.json
-python3 b70/serve/tests/multiturn.py --base http://127.0.0.1:8022 --model qwen3.8-27b-exl3
-
-# 4. Kernel checks inside the image (one card visible; needs the SC_5.00bpw_H6 files).
-docker run --rm --device=/dev/dri --group-add "$(stat -c %g /dev/dri/renderD128)" \
-  -e ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  -v "$PWD/b70/serve/tests:/work:ro" -v "$MODEL_DIR:/model:ro" \
-  --entrypoint python3 exl3xpu-b70:mixedk /work/check_mixedk.py --model /model
-```
-
-The patches apply to exl3xpu 0.1.0 with `patch -p1` (or `git apply`) from the
-package root (`/opt/exl3xpu` in the image).
-
-## Quickstart: quantizing
-
-Requirements: Intel oneAPI DPC++ (`icpx`; checked with 2026.1.1), PyTorch,
-`numpy`, `safetensors`. For ref.py-based checks you also need exl3xpu's `ref.py`
-(from the exl3xpu 0.1.0 source tree or `/opt/exl3xpu` in the image).
-
-```bash
-cd b70/quantize
-
-# 1. Build the ESIMD worker. JIT only: do NOT add -fsycl-targets=spir64_gen.
-bash build.sh                      # -> build/viterbi_esimd, build/libviterbi_esimd.so
-
-# 2. Kernel bit-exactness on one card (no model files needed).
+cd quantize
+bash build.sh        # JIT build with icpx. Do not add -fsycl-targets=spir64_gen
 python3 verify_viterbi.py gen 64 1 X64.bin
 ONEAPI_DEVICE_SELECTOR=level_zero:0 build/viterbi_esimd X64.bin 64 mul1p 0 128 st64.bin
 python3 verify_viterbi.py check X64.bin 64 mul1 0 128 st64.bin   # expect "exact-state seqs 64/64"
-
-# 3. CPU unit tests (ref.py checks need XTQ_REFSRC = dir containing exl3xpu/ref.py).
-XTQ_REFSRC=/path/to/exl3xpu-0.1.0 python3 test_quantize.py --device cpu --quick
-
-# 4. One real tensor, ESIMD vs torch at every LDLQ launch (needs >= 20 GiB host RAM for down_proj).
-XTQ_BF16=/path/to/Qwen3.8-27B XTQ_HDIR=/path/to/hessians XTQ_VIT_DEVIDX=0 \
-  python3 check_tensor_bitexact.py in_proj_qkv
 ```
-
-Per-tensor API (W in `nn.Linear` layout `[out, in]`, H = input Gram `[in, in]`):
 
 ```python
 import quantize as xq
@@ -178,46 +163,40 @@ r = xq.quantize_linear(W, H, code="exl3_mul1", K=4, use_ldlq=True, device="xpu",
 # r["trellis"] int16 [in/16, out/16, 16K], r["suh"], r["svh"] fp16, r["W_hat"]
 ```
 
-To build a model, save each tensor as `ROOT/L{nn}/{module}.safetensors` with
-keys `trellis`, `suh` and `svh`, then run
+Save each tensor as `ROOT/L{nn}/{module}.safetensors` (keys `trellis`, `suh`, `svh`) and run
 `PYTHONPATH=/path/to/exl3xpu-0.1.0/exl3xpu python3 export_exl3.py --tensors ROOT --template <turboderp EXL3 dir with the same K layout> --out OUT --check-keys`.
 
-**This is a per-tensor tool plus a writer, not a one-command model converter.**
-The full-model driver (calibration capture, Hessians, layer loop) is not published.
-You need your own calibration pass to produce H for each linear layer.
+Known limits: the AOT build (`-fsycl-targets=spir64_gen -device bmg`) gave wrong results,
+so use the JIT build. Bit-exact ties depend on the `min(d*d, FINF) + b` form in the kernel.
+Requirements: oneAPI DPC++ `icpx` (checked with 2026.1.1), PyTorch, numpy, safetensors, and
+exl3xpu's `ref.py` for the reference checks (`XTQ_REFSRC`).
 
-## Limits
+## Layout
 
-- **B70 / Xe2 only.** ESIMD and SYCL code with no CUDA path. Tested only on Linux
-  with the `xe` driver, one card per job, in a two-B70 host. Other Arc GPUs were not tested.
-- **The AOT build gave wrong results; use the JIT build.** With
-  `-fsycl-targets=spir64_gen -device bmg`, the scalar SYCL variant of the kernel
-  matched only 61/64 sequences (64/64 under JIT), and the ESIMD kernel's output was
-  also wrong. The ESIMD AOT build was not re-tested after later kernel fixes.
-  The worker JIT-compiles once per process.
-- **Exact floating-point ties.** The bit-exact results need the `min(d*d, FINF) + b`
-  emit form in the kernel. Without it, the ESIMD backend fuses `d*d + b` into one
-  rounding, and exact-cost ties then resolve differently from torch.
-- **No full-model result yet.** A full Qwen3.8-27B quant made by this quantizer is
-  still running, so full-model KL or perplexity has not been measured.
-- **Quality vs turboderp's quantizer is not better so far:**
-  - With turboderp's default calibration mix, per-tensor Hessian-weighted error on
-    layers 0–49 (312 tensors) is **in-sample** (the same calibration Gram the
-    quantizer was fit on): median 1.027× turboderp's, range 0.93–1.06×. That is
-    about 3 % higher error. Full-model quality is not measured yet.
-  - An earlier run with a 32K-token calibration set, scored on a 13-layer prefix,
-    had final-logit KL vs BF16 of **1.16×** (wiki) and **1.41×** (held-out chat)
-    relative to turboderp plain 4.0. On a held-out Gram, 79 of 87 tensors were
-    worse than turboderp's.
-- **Serving:** K = 8 and non-mul1 codebooks are not supported for mixed-K serving.
-  Mixed-K SC5 decode is about 0.88–0.89× plain 4.0 (see the table above).
-  Only Qwen3.8-27B checkpoints were tested.
-- All numbers are single-host screens (n = 3 or 5) and have not been independently reproduced.
+```
+NOTICE                          third-party credits and license text
+LICENSE                         MIT
+serve/Dockerfile                patched image on top of the pinned exl3xpu 0.1.0 digest
+serve/Dockerfile.labels         label-only layer used for the 20261014 tag
+serve/patches/0001-exl3-ops-mixed-k.patch      csrc/exl3_ops.sycl
+serve/patches/0002-vllm-plugin-mixed-k.patch   exl3xpu/vllm_plugin.py
+serve/run.sh                    serve command used for the checks
+serve/tests/check_mixedk.py     kernel checks against exl3xpu ref.py (run inside the image)
+serve/tests/canary.py           6 exact-answer canaries + 3 long-prompt cells
+serve/tests/multiturn.py        multi-turn prefix-cache check
+quantize/viterbi_esimd.cpp      ESIMD tail-biting Viterbi
+quantize/build.sh               JIT build with icpx
+quantize/quantize.py            quantizer (torch and ESIMD backends)
+quantize/export_exl3.py         EXL3 directory writer + self-tests
+quantize/verify_viterbi.py, check_tensor_bitexact.py, test_quantize.py   checks
+```
 
-## Credits
+This code used to live in the `b70/` directory of
+[SergiioB/exllamav3](https://github.com/SergiioB/exllamav3/tree/b70) (commit 244f57e);
+the history moved here.
 
-- **turboderp** — ExLlamaV3, the EXL3 format, and the Qwen3.8-27B EXL3 quants (MIT).
-- **0xSero** — exl3xpu, the ESIMD EXL3 kernels and vLLM XPU plugin that the serve patches modify (MIT).
-- **Cornell-RelaxML QTIP** — the BlockLDLQ and tail-biting Viterbi algorithms, reimplemented here.
+## Credits and license
 
-See [NOTICE](NOTICE) for copyright lines and license text.
+exl3xpu is by 0xSero, ExLlamaV3, EXL3 and the SC quants are by turboderp, and the
+quantization algorithms come from QTIP. This repository is MIT licensed (`LICENSE`).
+Third-party copyright lines and license text are in `NOTICE`.
