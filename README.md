@@ -118,13 +118,14 @@ output 128, n = 3 after one warmup, median), SC5 decoded at 56.7 tok/s without i
 
 ### Quality: SC5 is closer to BF16 than plain 4.0
 
-KL divergence of next-token distributions vs the BF16 model, as the ratio SC5 / plain 4.0
-(lower is better for SC5).
+KL divergence of the next-token probabilities against the BF16 model (same weights,
+native BF16 output heads), scored on one B70. Lower is closer to BF16. The chat text was
+not used to calibrate either quant.
 
-| Text | Positions | KL ratio SC5 / plain 4.0 | Top-1 agreement with BF16 (SC5 vs plain 4.0) |
-|---|---|---|---|
-| wikitext | 1,664 | 0.42x | not reported |
-| held-out chat | 1,531 | 0.16x | 98.1% vs 96.4% |
+| Text | Scored tokens | Plain 4.0 KL | SC5 KL | SC5 / plain | Same top token as BF16 (plain / SC5) |
+|---|---|---|---|---|---|
+| Wikitext prose | 1,664 | 0.01391 | 0.00582 | 0.42x | 94.65% / 96.57% |
+| Held-out chat | 1,531 | 0.00876 | 0.00141 | 0.16x | 96.41% / 98.11% |
 
 SC5 gives up 11 to 12% decode speed for lower error vs BF16.
 
