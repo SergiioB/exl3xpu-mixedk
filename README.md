@@ -38,13 +38,15 @@ Everything was run on Linux with the `xe` driver, one B70 per job.
 | `turboderp/Qwen3.8-27B-exl3` `4.00bpw` (uniform K = 4) | tested, no regression vs stock exl3xpu |
 | `turboderp/Qwen3.8-27B-exl3` `SC_5.00bpw_H6_V6` | not loadable yet: text weights are the same as `SC_5.00bpw_H6`, but the quantized vision tower keys fail to load |
 | Other EXL3 model architectures | untested. exl3xpu ships its own per-model routes |
-| `turboderp/Qwen3.8-Flash-Next-exl3` (any branch) | not supported. Checked 2026-10-14: the image's vLLM has no Flash-Next model class, exl3xpu has no MoE path, and the smallest quant (2.05 bpw, 58.5 GiB) does not fit one 32 GB card. On the B70 we run Flash-Next as GGUF with Strata instead |
+| `turboderp/Qwen3.8-Flash-Next-exl3` `2.05bpw_h4_ng4` | Experimental native XPU CLI: simple exact-answer prompts, repeats and a two-turn check passed on one B70 with disk-offloaded experts and n-gram rows. The declared same-artifact numerical gate failed; full BF16-reference KL was not produced before the deadline. Not a validated serving recipe; no FP8 KV, long-context, vision or MTP support claim. |
 | K = 8 or non-mul1 codebooks | not supported (`Geo<8>` fails a kernel static assert) |
 | CUDA or other GPUs | not supported. ESIMD/SYCL only, no CUDA path; other Arc GPUs not tested |
 
 ## Quick start
 
-With [b70-launcher](https://github.com/SergiioB/b70-launcher) 0.6.2 or later:
+With [b70-launcher](https://github.com/SergiioB/b70-launcher) 0.6.7 or later
+(SC5 defaults to the tested 196,608-token single-request inference profile;
+131,072 is the higher-reserve alternate):
 
 ```bash
 b70 launch qwen38-27b-sc5
@@ -62,7 +64,7 @@ docker run -d --name exl3xpu-b70 \
   --entrypoint python3 "$IMAGE" \
   /opt/exl3xpu/scripts/serve.py /opt/exl3xpu/models/qwen3.8-27b-exl3-4.00bpw \
   --gpu 0 --model-path /model --port 8022 \
-  --set vllm.gpu_memory_utilization=0.90 --set vllm.max_model_len=65536
+  --set vllm.gpu_memory_utilization=0.90 --set vllm.max_model_len=131072
 ```
 
 This serves an OpenAI-compatible API on port 8022 (model name `qwen3.8-27b-exl3`).
@@ -99,6 +101,24 @@ Models: `SC_5.00bpw_H6` at commit `dfe2f4fd` ("SC5") and `4.00bpw` at commit `11
 | `serve/tests/canary.py`, SC5, greedy, `max_tokens=512` | 6/6 exact answers, 3/3 long prompts (8,161 to 8,162 tokens) |
 | `serve/tests/multiturn.py`, prefix cache on, `SC_4.00bpw_H5` (other card, 180 W cap, `gpu_memory_utilization=0.85`) | pass: planted facts recalled on every later turn |
 
+### SC5 context capacity
+
+Capacity checks on one B70, FP8 KV and MTP3, same image digest:
+
+| Configuration | Highest checked occupied tokens | Free VRAM under load | Scope |
+|---|---|---|---|
+| 131,072 configured, memory utilization 0.90 | 130,872 | 2,327 MiB | Exact retrieval at two depths and multi-turn checks passed; recommended setting |
+| 206,000 configured, memory utilization 0.94 | 196,438 | 1,069 MiB | Same checks passed; capacity observation only, less reserve |
+
+The 168,000-token cache budget at utilization 0.90 is not a verified completion
+ceiling. Top-rung client timeouts were retained. These are capacity observations,
+not throughput benchmarks. Cache-hit counters were unavailable; cold requests
+used distinct prefixes, but zero cache-hit delta was not measured.
+Plain 4.0bpw's smaller weight footprint permits its separate 262,144-token route.
+No 270K context claim is made for SC5 or Flash-Next.
+
+[Protocol, raw requests and failures](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook/tree/677c18a6427a1117f25c6357170f99b58eb9f7f2/results/qwen38-27b/sc5-context-capacity-20261014).
+
 ### Speed: SC5 is slower than plain 4.0
 
 Paired A/B. A = plain 4.0 on stock `ghcr.io/0xsero/exl3xpu:0.1.0`, B = SC5 on this image.
@@ -118,9 +138,13 @@ output 128, n = 3 after one warmup, median), SC5 decoded at 56.7 tok/s without i
 
 ### Quality: SC5 is closer to BF16 than plain 4.0
 
-KL divergence of the next-token probabilities against the BF16 model (same weights,
-native BF16 output heads), scored on one B70. Lower is closer to BF16. The chat text was
-not used to calibrate either quant.
+Single-run, self-reported weight-quality screen on one B70: mean final-logit
+KL(P_bf16 || P_quant), using reference-decoded weights and FP32 matrix products
+through all 64 layers, with each arm's native output head. This does not measure
+the served engine's fp8 KV or MTP path, and is not a general task-quality result.
+Lower KL is closer to BF16. The datasets are a wikitext-2-raw-v1 test slice
+(2 × 832 scored positions) and rows 0–1 of turboderp's held-out
+`qbench_prompts_gen.json` trace (1,531 response positions).
 
 | Text | Scored tokens | Plain 4.0 KL | SC5 KL | SC5 / plain | Same top token as BF16 (plain / SC5) |
 |---|---|---|---|---|---|
@@ -128,6 +152,9 @@ not used to calibrate either quant.
 | Held-out chat | 1,531 | 0.00876 | 0.00141 | 0.16x | 96.41% / 98.11% |
 
 SC5 gives up 11 to 12% decode speed for lower error vs BF16.
+
+Method and raw screen results:
+[cookbook evidence](https://github.com/SergiioB/intel-arc-pro-b70-inference-cookbook/tree/57e99fc0d6914a6d537c8986f47cb32c4e48afd2/results/qwen38-27b/sc5-kl-screen-20261012).
 
 ## Our quantizer
 
